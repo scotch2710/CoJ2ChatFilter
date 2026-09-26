@@ -39,8 +39,9 @@ static const DWORD g_slotVAs[] = {
 static void* g_origFn    = NULL;
 static void* g_defString = NULL;
 
-struct CChatMsg;
-struct CNetPlayer;
+struct CChatMsg {};    // era: struct CChatMsg;
+struct CNetPlayer {};  // era: struct CNetPlayer;
+
 
 typedef int  (__thiscall CChatMsg::*DisplayChatMFn)(int param2);
 typedef void (__thiscall CNetPlayer::*GetNameMFn)(void* out, const void* def);
