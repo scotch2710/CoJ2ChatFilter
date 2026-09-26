@@ -1,0 +1,32 @@
+name: build CoJ2ChatFilter
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-x86:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scarica MinHook
+        run: git clone --depth 1 https://github.com/TsudaKageyu/minhook.git
+
+      - name: Compila (x86, MSVC, runtime statico)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86
+          cl /nologo /O2 /MT /EHsc /LD main.cpp ^
+             minhook\src\minhook.c minhook\src\buffer.c minhook\src\hook.c ^
+             minhook\src\trampoline.c minhook\src\hde\hde32.c ^
+             /Fe:CoJ2ChatFilter.dll /link user32.lib
+
+      - name: Pubblica l'artefatto
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoJ2ChatFilter-x86
+          path: |
+            CoJ2ChatFilter.dll
+            chatfilter.ini
