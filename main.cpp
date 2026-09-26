@@ -131,7 +131,7 @@ static bool ReadName(void* player, char* buf, size_t bufSize)
             push eax
             mov  edx, getName
             call edx
-            add  esp, 8
+            
         }
         return true;
     }
@@ -191,7 +191,7 @@ static int __fastcall Hook_Impl(void* self, int param2)
         mov  ecx, self
         push param2
         call dword ptr [g_origFn]
-        add  esp, 4
+       
         mov  ret, eax
     }
     return ret;
