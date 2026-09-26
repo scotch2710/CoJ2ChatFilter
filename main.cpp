@@ -1,6 +1,6 @@
 // ============================================================================
-//  CoJ2ChatFilter.dll  -  v7.1 OBSERVER: no writes, dumps structures to log
-//  Messages are NOT filtered yet - we collect real memory layout data.
+//  CoJ2ChatFilter.dll  -  v8 SAFE: team-only + hide-all, validated empty-text
+//  NO vtable calls (they crashed). Name-mute disabled pending player-struct dump.
 // ============================================================================
 
 #include <windows.h>
@@ -14,15 +14,13 @@ static HMODULE g_hModule = NULL;
 static HMODULE g_hGame   = NULL;
 
 static int  g_teamOnly   = 0;
-static int  g_useNames   = 1;
-static std::vector<std::string> g_mutes;
+static int  g_hideAll    = 0;
+static std::vector<std::string> g_mutes;   // parsed but INACTIVE in v8
 
 static void* g_origFn    = NULL;
-static void* g_defString = NULL;
 
 #define VA_DISPLAY_CHAT   0x103436B0
 #define VA_TEAM_PREFIX    0x107ED8E8
-#define VA_DEF_STRING     0x107ED894
 
 static const DWORD g_slotVAs[] = {
     0x107702e4, 0x10797af4, 0x107d3644,
@@ -41,7 +39,7 @@ static void LoadConfig()
 {
     g_mutes.clear();
     g_teamOnly = 0;
-    g_useNames = 1;
+    g_hideAll  = 0;
 
     char path[MAX_PATH];
     GetModuleFileNameA(g_hModule, path, MAX_PATH);
@@ -58,9 +56,9 @@ static void LoadConfig()
             p += 8; while (*p == ' ' || *p == '\t') ++p;
             g_teamOnly = (atoi(p) != 0);
         }
-        else if (_strnicmp(p, "mutenames", 9) == 0) {
-            p += 9; while (*p == ' ' || *p == '\t') ++p;
-            g_useNames = (atoi(p) != 0);
+        else if (_strnicmp(p, "hideall", 7) == 0) {
+            p += 7; while (*p == ' ' || *p == '\t') ++p;
+            g_hideAll = (atoi(p) != 0);
         }
         else if (_strnicmp(p, "mute", 4) == 0) {
             p += 4; while (*p == ' ' || *p == '\t') ++p;
@@ -86,21 +84,6 @@ static void Log(const char* fmt, ...)
     va_end(ap);
     fputc('\n', f);
     fclose(f);
-}
-
-static void LogHex(const char* label, const void* p, int n)
-{
-    char line[256];
-    int pos = sprintf_s(line, "%s @%p: ", label, p);
-    __try {
-        const unsigned char* b = (const unsigned char*)p;
-        for (int i = 0; i < n && pos < 240; ++i)
-            pos += sprintf_s(line + pos, sizeof(line) - pos, "%02X ", b[i]);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        sprintf_s(line + pos, sizeof(line) - pos, "<EXCEPTION>");
-    }
-    Log("%s", line);
 }
 
 // ------------------------------------------------------- module scanning ----
@@ -130,30 +113,18 @@ static bool FindBytes(const char* pattern, size_t len, void** out)
     return false;
 }
 
-// ------------------------------------------------------------- name read ----
-static bool ReadName(void* player, char* buf, size_t bufSize)
+// validated by the v7.1 dump: {char* ptr @ +0x24, int len @ +0x28, ...}
+static void EmptyMessageText(void* self)
 {
     __try {
-        void** vtbl = *(void***)player;
-        void* getName = (char*)vtbl + 0x14;
-        memset(buf, 0, bufSize);
-        __asm {
-            mov  ecx, player
-            push dword ptr [g_defString]
-            mov  eax, buf
-            push eax
-            mov  edx, getName
-            call edx
-        }
-        return true;
+        char* txt = *(char**)((char*)self + 0x24);
+        if (txt && (SIZE_T)txt > 0x10000 && !IsBadReadPtr(txt, 1))
+            txt[0] = 0;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
 }
 
 // ------------------------------------------------------------------ hook ----
-// OBSERVER: never drops, never writes. Logs structures. Always calls original.
 static int __fastcall Hook_Impl(void* self, int param2)
 {
     static bool f6Down = false;
@@ -162,35 +133,11 @@ static int __fastcall Hook_Impl(void* self, int param2)
 
     unsigned char flags = *(unsigned char*)((char*)self + 0x20);
 
-    Log("MSG flags=%02x self=%p", flags, self);
-    LogHex("  +0x24 msg-struct", (char*)self + 0x24, 16);
+    bool drop = g_hideAll
+             || (g_teamOnly && !(flags & 0x01));
 
-    if (g_teamOnly && !(flags & 0x01))
-        Log("  -> would DROP (not team)");
-
-    if (g_useNames && !g_mutes.empty()) {
-        void* player = *(void**)((char*)self + 0x14);
-        if (player && !IsBadReadPtr(player, 4)) {
-            char buf[32];
-            if (ReadName(player, buf, sizeof(buf))) {
-                LogHex("  name-struct", buf, 16);
-                const char* name = *(const char**)&buf[0];
-                if (name && (SIZE_T)name > 0x10000 && !IsBadReadPtr(name, 1)) {
-                    size_t nl = strnlen(name, 64);
-                    Log("  name='%.*s' (len=%u)", (int)(nl < 40 ? nl : 40), name, (unsigned)nl);
-                    for (size_t i = 0; i < g_mutes.size(); ++i)
-                        if (_stricmp(g_mutes[i].c_str(), name) == 0)
-                            Log("  -> would MUTE (matched)");
-                }
-                else {
-                    Log("  name ptr invalid: %p", name);
-                }
-            }
-            else {
-                Log("  ReadName EXCEPTION");
-            }
-        }
-    }
+    if (drop)
+        EmptyMessageText(self);
 
     int ret;
     __asm {
@@ -227,10 +174,9 @@ static void Install()
         return;
     }
     ptrdiff_t delta = (char*)sTeam - (char*)VA_TEAM_PREFIX;
-    g_origFn    = (char*)VA_DISPLAY_CHAT + delta;
-    g_defString = (char*)VA_DEF_STRING + delta;
-    Log("v7.1 observer: base=%p orig=%p teamonly=%d mutenames=%d mutes=%u",
-        g_hGame, g_origFn, g_teamOnly, g_useNames, (unsigned)g_mutes.size());
+    g_origFn = (char*)VA_DISPLAY_CHAT + delta;
+    Log("v8: base=%p orig=%p teamonly=%d hideall=%d (mute-by-name inactive)",
+        g_hGame, g_origFn, g_teamOnly, g_hideAll);
 
     int patched = 0, skipped = 0;
     for (size_t i = 0; i < sizeof(g_slotVAs)/sizeof(g_slotVAs[0]); ++i) {
