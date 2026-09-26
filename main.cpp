@@ -1,13 +1,12 @@
 // ============================================================================
 //  CoJ2ChatFilter.dll  -  Call of Juarez: Bound in Blood
-//  v3: target auto-verification + debug log
+//  v4: address auto-discovery (ASLR-proof) + debug log
 // ============================================================================
 
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
-#include <intrin.h>
 #include <vector>
 #include <string>
 #include "MinHook.h"
@@ -19,6 +18,14 @@ static int  g_teamOnly   = 0;
 static int  g_useNames   = 1;
 static int  g_debug      = 0;
 static std::vector<std::string> g_mutes;
+
+// Ghidra VAs (constants - do NOT depend on load address)
+#define VA_DISPLAY_CHAT   0x103436B0
+#define VA_TEAM_PREFIX    0x107ED8E8   // "&ChatTeamModeMsgPrefix&"
+#define VA_DEF_STRING     0x107ED894
+
+static void* g_target    = NULL;
+static void* g_defString = NULL;
 
 struct CChatMsg;
 struct CNetPlayer;
@@ -86,6 +93,33 @@ static void DbgLog(const char* fmt, ...)
     fclose(f);
 }
 
+// ------------------------------------------------------- module scanning ----
+static size_t ModuleSize(HMODULE h)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    size_t size = 0;
+    unsigned char* p = (unsigned char*)h;
+    while (VirtualQuery(p, &mbi, sizeof(mbi)) && mbi.AllocationBase == (void*)h) {
+        size += mbi.RegionSize;
+        p += mbi.RegionSize;
+    }
+    return size;
+}
+
+static bool FindBytes(const char* pattern, size_t len, void** out)
+{
+    unsigned char* start = (unsigned char*)g_hGame;
+    unsigned char* end = start + ModuleSize(g_hGame);
+    unsigned char* p = start;
+    while (p + len < end) {
+        p = (unsigned char*)memchr(p, (unsigned char)pattern[0], end - p - len);
+        if (!p) return false;
+        if (memcmp(p, pattern, len) == 0) { *out = p; return true; }
+        ++p;
+    }
+    return false;
+}
+
 // ------------------------------------------------------------------ hook ----
 static DisplayChatMFn g_origDisplay = NULL;
 
@@ -107,13 +141,12 @@ static int __fastcall Hook_DisplayChat(void* self, int /*edx_unused*/)
         void* player = *(void**)((char*)self + 0x14);
         if (player) {
             void** vtbl = *(void***)player;
-            const void* defStr = (const char*)g_hGame + 0x7ED894;
             union { void* p; GetNameMFn m; } u = { NULL };
             u.p = (char*)vtbl + 0x14;
             char strBuf[32];
             memset(strBuf, 0, sizeof(strBuf));
             __try {
-                (reinterpret_cast<CNetPlayer*>(player)->*u.m)(strBuf, defStr);
+                (reinterpret_cast<CNetPlayer*>(player)->*u.m)(strBuf, g_defString);
                 const char* name = *(const char**)&strBuf[0];
                 DbgLog("  nameptr=%p raw=%02x %02x %02x %02x",
                        name, (unsigned char)strBuf[0], (unsigned char)strBuf[1],
@@ -124,8 +157,10 @@ static int __fastcall Hook_DisplayChat(void* self, int /*edx_unused*/)
                            (int)(nl < 32 ? nl : 32), name);
                     if (nl > 0 && nl < 64) {
                         for (size_t i = 0; i < g_mutes.size(); ++i)
-                            if (_stricmp(g_mutes[i].c_str(), name) == 0)
+                            if (_stricmp(g_mutes[i].c_str(), name) == 0) {
+                                DbgLog("  -> muted, dropped");
                                 return param2;
+                            }
                     }
                 }
             }
@@ -134,31 +169,10 @@ static int __fastcall Hook_DisplayChat(void* self, int /*edx_unused*/)
             }
         }
     }
-    DbgLog("  calling original, param2=%08x", param2);
-    int ret = (reinterpret_cast<CChatMsg*>(self)->*g_origDisplay)(param2);
-    DbgLog("  original returned %08x", ret);
-    return ret;
+    return (reinterpret_cast<CChatMsg*>(self)->*g_origDisplay)(param2);
 }
 
 // ------------------------------------------------------------- install ------
-#define RVA_DISPLAY_CHAT  0x3436B0
-#define RVA_DEF_STRING    0x7ED894
-
-// FUN_103436b0 references &ChatTeamModeMsgPrefix (RVA 0x7ED8E8) within its
-// first bytes. Scan for a rel32 that resolves to that address: if absent,
-// the target address is WRONG (bad image base) -> do not hook.
-static bool VerifyTarget(void* target)
-{
-    unsigned char* base = (unsigned char*)g_hGame;
-    for (int i = 0; i < 0x200 - 4; ++i) {
-        DWORD rel = *(DWORD*)((unsigned char*)target + i);
-        DWORD instrRva = (DWORD)((unsigned char*)target + i + 4 - base);
-        if (instrRva + rel == RVA_DEF_STRING)
-            return true;
-    }
-    return false;
-}
-
 static void Install()
 {
     for (int i = 0; i < 120 && !g_hGame; ++i) {
@@ -169,19 +183,22 @@ static void Install()
 
     LoadConfig();
 
-    void* target = (char*)g_hGame + RVA_DISPLAY_CHAT;
-    DbgLog("base=%p target=%p", g_hGame, target);
-
-    if (!VerifyTarget(target)) {
-        DbgLog("VERIFY FAILED: target is NOT FUN_103436b0 - image base assumption wrong");
+    // --- auto-discovery: find the team-prefix string in memory, compute delta
+    void* sTeam = NULL;
+    if (!FindBytes("&ChatTeamModeMsgPrefix&", 24, &sTeam)) {
+        DbgLog("ERROR: team prefix string not found in module");
         return;
     }
-    DbgLog("VERIFY OK");
+    ptrdiff_t delta = (char*)sTeam - (char*)VA_TEAM_PREFIX;
+    g_target    = (char*)VA_DISPLAY_CHAT + delta;
+    g_defString = (char*)VA_DEF_STRING + delta;
+    DbgLog("base=%p string found=%p delta=%+d target=%p def=%p",
+           g_hGame, sTeam, (int)delta, g_target, g_defString);
 
     if (MH_Initialize() != MH_OK) { DbgLog("MH_Initialize failed"); return; }
     void* tramp = NULL;
-    if (MH_CreateHook(target, &Hook_DisplayChat, &tramp) != MH_OK) { DbgLog("MH_CreateHook failed"); return; }
-    if (MH_EnableHook(target) != MH_OK) { DbgLog("MH_EnableHook failed"); return; }
+    if (MH_CreateHook(g_target, &Hook_DisplayChat, &tramp) != MH_OK) { DbgLog("MH_CreateHook failed"); return; }
+    if (MH_EnableHook(g_target) != MH_OK) { DbgLog("MH_EnableHook failed"); return; }
 
     union { void* p; DisplayChatMFn m; } u = { NULL };
     u.p = tramp;
