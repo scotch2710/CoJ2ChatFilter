@@ -3,18 +3,20 @@
 //  Client-side chat filter: mute by player name + team-only mode
 //
 //  Target : CoJ2_x86.dll  (32-bit)
-//  Hook   : FUN_103436b0  (RVA = 0x103436B0 - image base, see below)
-//           The "format & display chat line" handler. The net message object
-//           ('this') layout decoded from the decompiled function:
+//  Hook   : FUN_103436b0  (RVA = 0x103436B0 - image base)
+//           "format & display chat line" handler, invoked via function-pointer
+//           tables (one entry per MP mode), so one hook covers everything.
+//           Net message object ('this') layout from the decompiled function:
 //             +0x14 : player object (vtable[+0x14] = GetName(engineString*, def))
 //             +0x20 : mode flags  0x01 = TEAM, 0x10 = inactive, 0x20 = dead
 //             +0x24 : message text
 //             +0x99 : processed flag
 //
-//  Build  : Visual Studio, Win32 (x86!), Release, static runtime (/MT)
-//           Add MinHook (minhook.c/.h) to the project.
-//  Inject : any x86 DLL injector into CoJBiBGame_x86.exe AFTER the game
-//           started (the dll waits for CoJ2_x86.dll and retries).
+//  NOTE on calling convention:
+//    FUN_103436b0 is __thiscall. MSVC forbids __thiscall on free functions,
+//    so the hook entry is __fastcall (arg1 in ECX == 'this', matching), and
+//    the original is called through member-function-pointer unions.
+//
 //  Config : chatfilter.ini next to this dll:
 //             teamonly 1        -> show only team messages
 //             mute SomePlayer   -> hide all messages from SomePlayer
@@ -25,6 +27,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <intrin.h>
 #include <vector>
 #include <string>
 #include "MinHook.h"
@@ -35,6 +38,13 @@ static HMODULE g_hGame   = NULL;
 static int  g_teamOnly   = 0;
 static int  g_useNames   = 1;
 static std::vector<std::string> g_mutes;
+
+// opaque tags (never dereferenced - only used for member-fn-ptr calls)
+struct CChatMsg;
+struct CNetPlayer;
+
+typedef int  (__thiscall CChatMsg::*DisplayChatMFn)(int param2);
+typedef void (__thiscall CNetPlayer::*GetNameMFn)(void* out, const char* def);
 
 // ---------------------------------------------------------------- config ----
 static void LoadConfig()
@@ -74,16 +84,20 @@ static void LoadConfig()
     fclose(f);
 }
 
-// ----------------------------------------------------------------- hook -----
-typedef int (__thiscall *DisplayChatFn)(void* self, int param2);
-static DisplayChatFn g_origDisplay = NULL;
+// ------------------------------------------------------------------ hook ----
+// MinHook jumps here with the original __thiscall state:
+//   ECX = this, [ESP+4] = param2. __fastcall puts arg1 in ECX - matching.
+static DisplayChatMFn g_origDisplay = NULL;
 
-static int __thiscall Hook_DisplayChat(void* self, int param2)
+static int __fastcall Hook_DisplayChat(void* self, int /*edx_unused*/)
 {
     // F6 = reload config
     static bool f6Down = false;
     if (GetAsyncKeyState(VK_F6) & 0x8000) { if (!f6Down) { f6Down = true; LoadConfig(); } }
     else f6Down = false;
+
+    // caller's param2 sits right above the return address
+    int param2 = *(int*)((char*)_AddressOfReturnAddress() + 4);
 
     unsigned char flags = *(unsigned char*)((char*)self + 0x20);
     if (g_teamOnly && !(flags & 0x01))
@@ -94,13 +108,13 @@ static int __thiscall Hook_DisplayChat(void* self, int param2)
         if (player) {
             void** vtbl = *(void***)player;
             // vtable[5] (+0x14): GetName(engineString* out, const char* def)
-            typedef void (__thiscall *GetNameFn)(void*, void*, const char*);
-            GetNameFn getName = (GetNameFn)((char*)vtbl + 0x14);
+            union { void* p; GetNameMFn m; } u;
+            u.p = (char*)vtbl + 0x14;
 
             char strBuf[16];
             memset(strBuf, 0, sizeof(strBuf));
             __try {
-                getName(player, strBuf, "");
+                (reinterpret_cast<CNetPlayer*>(player)->*u.m)(strBuf, "");
                 const char* name = *(const char**)&strBuf[0];
                 if (name && (SIZE_T)name > 0x10000 && !IsBadReadPtr(name, 1)) {
                     size_t nl = strnlen(name, 64);
@@ -115,17 +129,16 @@ static int __thiscall Hook_DisplayChat(void* self, int param2)
             __except (EXCEPTION_EXECUTE_HANDLER) { /* name read failed: show msg */ }
         }
     }
-    return g_origDisplay(self, param2);
+    return (reinterpret_cast<CChatMsg*>(self)->*g_origDisplay)(param2);
 }
 
 // ------------------------------------------------------------- install ------
-// IMPORTANT: verify the image base in Ghidra (Program -> Memory / headers).
-// Default Chrome Engine dll base is 0x10000000, so the RVA of FUN_103436b0 is:
+// Verify the image base in Ghidra (headers). Default Chrome Engine dll base
+// is 0x10000000, so the RVA of FUN_103436b0 is:
 #define RVA_DISPLAY_CHAT  0x3436B0   // = 0x103436B0 - 0x10000000
 
 static void Install()
 {
-    // wait until the game module is loaded (max ~60 s)
     for (int i = 0; i < 120 && !g_hGame; ++i) {
         g_hGame = GetModuleHandleA("CoJ2_x86.dll");
         if (!g_hGame) Sleep(500);
@@ -137,8 +150,14 @@ static void Install()
     LoadConfig();
 
     if (MH_Initialize() != MH_OK) return;
-    if (MH_CreateHook(target, &Hook_DisplayChat, (void**)&g_origDisplay) != MH_OK) return;
+
+    void* tramp = NULL;
+    if (MH_CreateHook(target, &Hook_DisplayChat, &tramp) != MH_OK) return;
     if (MH_EnableHook(target) != MH_OK) return;
+
+    union { void* p; DisplayChatMFn m; } u;
+    u.p = tramp;
+    g_origDisplay = u.m;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
