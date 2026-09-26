@@ -1,6 +1,5 @@
 // ============================================================================
-//  CoJ2ChatFilter.dll  -  v8 SAFE: team-only + hide-all, validated empty-text
-//  NO vtable calls (they crashed). Name-mute disabled pending player-struct dump.
+//  CoJ2ChatFilter.dll  -  v8.1 SAFE + crash logger (VEH)
 // ============================================================================
 
 #include <windows.h>
@@ -15,7 +14,7 @@ static HMODULE g_hGame   = NULL;
 
 static int  g_teamOnly   = 0;
 static int  g_hideAll    = 0;
-static std::vector<std::string> g_mutes;   // parsed but INACTIVE in v8
+static std::vector<std::string> g_mutes;
 
 static void* g_origFn    = NULL;
 
@@ -33,6 +32,40 @@ static const DWORD g_slotVAs[] = {
     0x107e8eb4, 0x107e8fe4, 0x107e9114,
     0x107edbb4
 };
+
+// ---------------------------------------------------------------- logging ---
+static void Log(const char* fmt, ...)
+{
+    char path[MAX_PATH];
+    GetModuleFileNameA(g_hModule, path, MAX_PATH);
+    char* slash = strrchr(path, '\\');
+    if (slash) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "chatfilter.log");
+    FILE* f = NULL;
+    if (fopen_s(&f, path, "a") != 0 || !f) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+// CRASH LOGGER: logs any access violation before the process dies
+static LONG CALLBACK VehCrashLogger(PEXCEPTION_POINTERS ei)
+{
+    DWORD code = ei->ExceptionRecord->ExceptionCode;
+    if (code == 0xC0000005 || code == 0xC00000FD || code == 0x80000003) {
+        ULONG_PTR* info = ei->ExceptionRecord->ExceptionInformation;
+        Log("CRASH code=%08X at=%p op=%d addr=%p esp=%08x ecx=%08x eax=%08x",
+            code,
+            ei->ExceptionRecord->ExceptionAddress,
+            (info && code == 0xC0000005) ? (int)info[0] : -1,
+            (info && code == 0xC0000005) ? (void*)info[1] : NULL,
+            ei->ContextRecord->Esp,
+            ei->ContextRecord->Ecx,
+            ei->ContextRecord->Eax);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 // ---------------------------------------------------------------- config ----
 static void LoadConfig()
@@ -71,21 +104,6 @@ static void LoadConfig()
     fclose(f);
 }
 
-static void Log(const char* fmt, ...)
-{
-    char path[MAX_PATH];
-    GetModuleFileNameA(g_hModule, path, MAX_PATH);
-    char* slash = strrchr(path, '\\');
-    if (slash) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "chatfilter.log");
-    FILE* f = NULL;
-    if (fopen_s(&f, path, "a") != 0 || !f) return;
-    va_list ap; va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    va_end(ap);
-    fputc('\n', f);
-    fclose(f);
-}
-
 // ------------------------------------------------------- module scanning ----
 static size_t ModuleSize(HMODULE h)
 {
@@ -113,13 +131,15 @@ static bool FindBytes(const char* pattern, size_t len, void** out)
     return false;
 }
 
-// validated by the v7.1 dump: {char* ptr @ +0x24, int len @ +0x28, ...}
-static void EmptyMessageText(void* self)
+// replace message text with a single space: invisible but structurally valid
+static void BlankMessageText(void* self)
 {
     __try {
         char* txt = *(char**)((char*)self + 0x24);
-        if (txt && (SIZE_T)txt > 0x10000 && !IsBadReadPtr(txt, 1))
-            txt[0] = 0;
+        if (txt && (SIZE_T)txt > 0x10000 && !IsBadReadPtr(txt, 2)) {
+            txt[0] = ' ';
+            txt[1] = 0;
+        }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { }
 }
@@ -137,7 +157,7 @@ static int __fastcall Hook_Impl(void* self, int param2)
              || (g_teamOnly && !(flags & 0x01));
 
     if (drop)
-        EmptyMessageText(self);
+        BlankMessageText(self);
 
     int ret;
     __asm {
@@ -175,8 +195,7 @@ static void Install()
     }
     ptrdiff_t delta = (char*)sTeam - (char*)VA_TEAM_PREFIX;
     g_origFn = (char*)VA_DISPLAY_CHAT + delta;
-    Log("v8: base=%p orig=%p teamonly=%d hideall=%d (mute-by-name inactive)",
-        g_hGame, g_origFn, g_teamOnly, g_hideAll);
+    Log("v8.1: base=%p orig=%p teamonly=%d hideall=%d", g_hGame, g_origFn, g_teamOnly, g_hideAll);
 
     int patched = 0, skipped = 0;
     for (size_t i = 0; i < sizeof(g_slotVAs)/sizeof(g_slotVAs[0]); ++i) {
@@ -198,6 +217,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH) {
         g_hModule = hModule;
         DisableThreadLibraryCalls(hModule);
+        AddVectoredExceptionHandler(1, VehCrashLogger);
         CreateThread(NULL, 0,
             [](LPVOID) -> DWORD { Sleep(1000); Install(); return 0; },
             NULL, 0, NULL);
