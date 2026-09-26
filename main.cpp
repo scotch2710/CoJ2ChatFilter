@@ -1,6 +1,7 @@
 // ============================================================================
 //  CoJ2ChatFilter.dll  -  Call of Juarez: Bound in Blood
-//  v4: address auto-discovery (ASLR-proof) + debug log
+//  v6: hook via function-pointer table patching (no code patch, no MinHook)
+//      drop = empty message text; original always runs intact
 // ============================================================================
 
 #include <windows.h>
@@ -9,7 +10,6 @@
 #include <string.h>
 #include <vector>
 #include <string>
-#include "MinHook.h"
 
 static HMODULE g_hModule = NULL;
 static HMODULE g_hGame   = NULL;
@@ -19,12 +19,24 @@ static int  g_useNames   = 1;
 static int  g_debug      = 0;
 static std::vector<std::string> g_mutes;
 
-// Ghidra VAs (constants - do NOT depend on load address)
 #define VA_DISPLAY_CHAT   0x103436B0
-#define VA_TEAM_PREFIX    0x107ED8E8   // "&ChatTeamModeMsgPrefix&"
+#define VA_TEAM_PREFIX    0x107ED8E8
 #define VA_DEF_STRING     0x107ED894
 
-static void* g_target    = NULL;
+// function-pointer table slots that point to FUN_103436b0 (from Ghidra xrefs)
+static const DWORD g_slotVAs[] = {
+    0x107702e4, 0x10797af4, 0x107d3644,
+    0x107de5e4, 0x107de714, 0x107de844, 0x107de974, 0x107deaa4,
+    0x107debd4, 0x107ded04, 0x107dee34, 0x107def64, 0x107df094,
+    0x107df1c4, 0x107df2f4, 0x107df424, 0x107df554,
+    0x107e10e4, 0x107e24c4, 0x107e42dc, 0x107e440c,
+    0x107e4ac4, 0x107e4bf4, 0x107e4d24,
+    0x107e6f0c, 0x107e7964,
+    0x107e8eb4, 0x107e8fe4, 0x107e9114,
+    0x107edbb4
+};
+
+static void* g_origFn    = NULL;
 static void* g_defString = NULL;
 
 struct CChatMsg;
@@ -121,55 +133,72 @@ static bool FindBytes(const char* pattern, size_t len, void** out)
 }
 
 // ------------------------------------------------------------------ hook ----
-static DisplayChatMFn g_origDisplay = NULL;
+static void EmptyMessageText(void* self)
+{
+    __try {
+        char** txtPtr = (char**)((char*)self + 0x24);
+        if (!IsBadReadPtr(txtPtr, 4)) {
+            char* txt = *txtPtr;
+            if (txt && (SIZE_T)txt > 0x10000 && !IsBadReadPtr(txt, 1))
+                txt[0] = 0;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
 
+// called via table pointers with __thiscall: ECX = this, [ESP+4] = param2
 static int __fastcall Hook_DisplayChat(void* self, int /*edx_unused*/)
 {
     static bool f6Down = false;
     if (GetAsyncKeyState(VK_F6) & 0x8000) { if (!f6Down) { f6Down = true; LoadConfig(); } }
     else f6Down = false;
 
-    int param2 = *(int*)((char*)_AddressOfReturnAddress() + 4);
     unsigned char flags = *(unsigned char*)((char*)self + 0x20);
-
-    DbgLog("hook fired: self=%p flags=%02x", self, flags);
+    int param2 = *(int*)((char*)_AddressOfReturnAddress() + 4);
+    bool drop = false;
 
     if (g_teamOnly && !(flags & 0x01))
-        return param2;
+        drop = true;
 
-    if (g_useNames && !g_mutes.empty()) {
+    if (!drop && g_useNames && !g_mutes.empty()) {
         void* player = *(void**)((char*)self + 0x14);
-        if (player) {
+        if (player && !IsBadReadPtr(player, 4)) {
             void** vtbl = *(void***)player;
-            union { void* p; GetNameMFn m; } u = { NULL };
-            u.p = (char*)vtbl + 0x14;
-            char strBuf[32];
-            memset(strBuf, 0, sizeof(strBuf));
-            __try {
-                (reinterpret_cast<CNetPlayer*>(player)->*u.m)(strBuf, g_defString);
-                const char* name = *(const char**)&strBuf[0];
-                DbgLog("  nameptr=%p raw=%02x %02x %02x %02x",
-                       name, (unsigned char)strBuf[0], (unsigned char)strBuf[1],
-                       (unsigned char)strBuf[2], (unsigned char)strBuf[3]);
-                if (name && (SIZE_T)name > 0x10000 && !IsBadReadPtr(name, 1)) {
-                    size_t nl = strnlen(name, 64);
-                    DbgLog("  namelen=%u name='%.*s'", (unsigned)nl,
-                           (int)(nl < 32 ? nl : 32), name);
-                    if (nl > 0 && nl < 64) {
-                        for (size_t i = 0; i < g_mutes.size(); ++i)
-                            if (_stricmp(g_mutes[i].c_str(), name) == 0) {
-                                DbgLog("  -> muted, dropped");
-                                return param2;
-                            }
+            if (vtbl && !IsBadReadPtr(vtbl, 4)) {
+                union { void* p; GetNameMFn m; } u = { NULL };
+                u.p = (char*)vtbl + 0x14;
+                char strBuf[32];
+                memset(strBuf, 0, sizeof(strBuf));
+                __try {
+                    (reinterpret_cast<CNetPlayer*>(player)->*u.m)(strBuf, g_defString);
+                    const char* name = *(const char**)&strBuf[0];
+                    DbgLog("hook: flags=%02x nameptr=%p", flags, name);
+                    if (name && (SIZE_T)name > 0x10000 && !IsBadReadPtr(name, 1)) {
+                        size_t nl = strnlen(name, 64);
+                        DbgLog("  name='%.*s'", (int)(nl < 32 ? nl : 32), name);
+                        if (nl > 0 && nl < 64)
+                            for (size_t i = 0; i < g_mutes.size(); ++i)
+                                if (_stricmp(g_mutes[i].c_str(), name) == 0) { drop = true; break; }
                     }
                 }
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-                DbgLog("  EXCEPTION reading name");
+                __except (EXCEPTION_EXECUTE_HANDLER) {
+                    DbgLog("  EXCEPTION reading name");
+                }
             }
         }
     }
-    return (reinterpret_cast<CChatMsg*>(self)->*g_origDisplay)(param2);
+    else {
+        DbgLog("hook: flags=%02x", flags);
+    }
+
+    if (drop) {
+        DbgLog("  -> DROPPED (emptied)");
+        EmptyMessageText(self);
+    }
+
+    union { void* p; DisplayChatMFn m; } uo = { NULL };
+    uo.p = g_origFn;
+    return (reinterpret_cast<CChatMsg*>(self)->*uo.m)(param2);
 }
 
 // ------------------------------------------------------------- install ------
@@ -183,29 +212,37 @@ static void Install()
 
     LoadConfig();
 
-    // --- auto-discovery: find the team-prefix string in memory, compute delta
     void* sTeam = NULL;
     if (!FindBytes("&ChatTeamModeMsgPrefix&", 24, &sTeam)) {
         DbgLog("ERROR: team prefix string not found in module");
         return;
     }
     ptrdiff_t delta = (char*)sTeam - (char*)VA_TEAM_PREFIX;
-    g_target    = (char*)VA_DISPLAY_CHAT + delta;
+    g_origFn    = (char*)VA_DISPLAY_CHAT + delta;
     g_defString = (char*)VA_DEF_STRING + delta;
-    DbgLog("base=%p string found=%p delta=%+d target=%p def=%p",
-           g_hGame, sTeam, (int)delta, g_target, g_defString);
+    DbgLog("base=%p found=%p delta=%+d orig=%p", g_hGame, sTeam, (int)delta, g_origFn);
 
-    if (MH_Initialize() != MH_OK) { DbgLog("MH_Initialize failed"); return; }
-    void* tramp = NULL;
-    if (MH_CreateHook(g_target, &Hook_DisplayChat, &tramp) != MH_OK) { DbgLog("MH_CreateHook failed"); return; }
-    if (MH_EnableHook(g_target) != MH_OK) { DbgLog("MH_EnableHook failed"); return; }
-
-    union { void* p; DisplayChatMFn m; } u = { NULL };
-    u.p = tramp;
-    g_origDisplay = u.m;
-
-    DbgLog("installed. teamonly=%d mutenames=%d mutes=%u tramp=%p",
-           g_teamOnly, g_useNames, (unsigned)g_mutes.size(), tramp);
+    // patch every table slot that currently points to the original function
+    int patched = 0, skipped = 0;
+    for (size_t i = 0; i < sizeof(g_slotVAs)/sizeof(g_slotVAs[0]); ++i) {
+        void** slot = (void**)((char*)g_hGame + (ptrdiff_t)g_slotVAs[i] + delta - 0x10000000);
+        // note: slotVAs are Ghidra VAs with base 0x10000000 baked in -> convert to RVA
+        // (delta already accounts for the runtime base difference)
+        slot = (void**)((char*)0 + (ptrdiff_t)g_slotVAs[i] + delta);
+        if (!IsBadReadPtr(slot, 4) && *slot == g_origFn) {
+            DWORD oldProt;
+            if (VirtualProtect(slot, 4, PAGE_READWRITE, &oldProt)) {
+                *slot = (void*)&Hook_DisplayChat;
+                VirtualProtect(slot, 4, oldProt, &oldProt);
+                ++patched;
+            }
+            else ++skipped;
+        }
+        else ++skipped;
+    }
+    DbgLog("installed: slots patched=%d skipped=%d teamonly=%d mutenames=%d mutes=%u",
+           patched, skipped, g_teamOnly, g_useNames, (unsigned)g_mutes.size());
+    if (patched == 0) DbgLog("WARNING: no slots patched - hook inactive!");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
